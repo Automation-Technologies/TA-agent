@@ -18,6 +18,12 @@ class IngestionClient:
 
     _HTTP_TOTAL_TIMEOUT_SECONDS = 120
     _HTTP_CONNECT_TIMEOUT_SECONDS = 30
+    # Cloudflare на tasbots.com банит библиотечные User-Agent (error 1010).
+    # Представляемся браузером, как и WebSocket-клиент агента.
+    _USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 
     def __init__(self, base_url: str, agent_token: str) -> None:
         self._base_url = base_url.rstrip("/")
@@ -27,6 +33,7 @@ class IngestionClient:
             total=self._HTTP_TOTAL_TIMEOUT_SECONDS,
             connect=self._HTTP_CONNECT_TIMEOUT_SECONDS,
         )
+        self._headers = {"User-Agent": self._USER_AGENT}
 
     async def check_existence(self, accounts: List[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -50,7 +57,7 @@ class IngestionClient:
             "accounts": accounts,
         }
 
-        async with aiohttp.ClientSession(timeout=self._timeout) as session:
+        async with aiohttp.ClientSession(timeout=self._timeout, headers=self._headers) as session:
             async with session.post(url, json=payload, ssl=self._ssl_context) as resp:
                 if resp.status == 401:
                     raise aiohttp.ClientResponseError(
@@ -90,7 +97,7 @@ class IngestionClient:
             "accounts": accounts,
         }
 
-        async with aiohttp.ClientSession(timeout=self._timeout) as session:
+        async with aiohttp.ClientSession(timeout=self._timeout, headers=self._headers) as session:
             async with session.post(url, json=payload, ssl=self._ssl_context) as resp:
                 if resp.status == 401:
                     raise aiohttp.ClientResponseError(
