@@ -88,6 +88,12 @@ def merge_items_with_descriptions_from_listing(listings: dict, ids_to_assets_add
     for listing_id, listing in listings.get("sell_listings").items():
         asset_address = ids_to_assets_address[listing_id]
         description = descriptions[asset_address[0]][asset_address[1]][asset_address[2]]
+        # ID игры листинга берём из адреса ассета (g_rgAssets ключуется как
+        # {appid: {contextid: {assetid: описание}}}), а не из самого описания:
+        # так appid гарантированно есть и не зависит от того, какие поля Steam
+        # положил в описание. Нужен серверу, когда аккаунт торгует несколькими играми.
+        description = copy.copy(description)
+        description.setdefault("appid", asset_address[0])
         listing["description"] = description
     return listings
 
@@ -161,16 +167,45 @@ def get_buy_orders_from_node(node: Tag) -> dict:
     for order in buy_orders_raw:
         mem = order
         qnt_price_raw = order.select("span[class=market_listing_price]")[0].text.split("@")
-        named = str(order.a).split(order.a.text)[0]
-        named = named.split('/')
-        named = named[len(named) - 1]
-        named = named.replace('">', '')
-        named = unquote(named)
+
+        # Имя и appid берём из ссылки /market/listings/{appid}/{name}: там лежит
+        # канонический market_hash_name в URL-кодировке.
+        #
+        # Прежний разбор резал HTML тега по тексту ссылки
+        # (str(order.a).split(order.a.text)[0]) и врал в двух случаях:
+        #   • имя без спецсимволов встречается в самом href — split резал по вхождению
+        #     ВНУТРИ адреса, оставался хвост ".../listings/252490/", и после split('/')
+        #     имя выходило ПУСТЫМ ("Metal", "Hazma", "Skull" — короткие имена Rust);
+        #   • имя содержит HTML-сущность: BeautifulSoup отдаёт текст "Dreams & Nightmares
+        #     Case", а в разметке стоит "Dreams &amp; Nightmares Case" — разделитель не
+        #     находился, split возвращал тег целиком, и именем становился обломок "a>".
+        #
+        # Заявку с испорченным именем сервер не узнаёт как уже выставленную: каждый цикл
+        # планирует на этот предмет новую и получает от Steam success=29 ("You already
+        # have an active buy order for this item"), а слот из 1000 залипает навсегда.
+        #
+        # Разбор fail-safe: если Steam изменит вёрстку, откатываемся на текст ссылки,
+        # а appid останется пустым — заявка в любом случае не потеряется.
+        app_id_val = ""
+        named = ""
+        try:
+            href = mem.a.get("href", "") if mem.a is not None else ""
+            if "/market/listings/" in href:
+                tail = href.split("/market/listings/", 1)[1]
+                app_id_val, _, name_encoded = tail.partition("/")
+                named = unquote(name_encoded.split("?")[0].split("#")[0])
+        except Exception:
+            app_id_val = ""
+            named = ""
+
+        if not named and mem.a is not None:
+            named = mem.a.text.strip()
         order = {
             "order_id": order.attrs["id"].replace("mybuyorder_", ""),
             "quantity": int(qnt_price_raw[0].strip()),
             "price": qnt_price_raw[1].strip(),
-            "item_name": named
+            "item_name": named,
+            "appid": app_id_val
         }
         buy_orders_dict[order["order_id"]] = order
     return buy_orders_dict
