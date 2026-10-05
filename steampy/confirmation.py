@@ -7,7 +7,7 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup, SoupStrainer
 
 from steampy import guard
-from steampy.exceptions import ConfirmationExpected
+from steampy.exceptions import ConfirmationExpected, SessionNeedsAuth
 from steampy.login import InvalidCredentials
 
 
@@ -51,17 +51,36 @@ class ConfirmationExecutor:
         confirmations = []
         confirmations_page = self._fetch_confirmations_page()
 
-        if confirmations_page.status_code == 200:
-            confirmations_json = json.loads(confirmations_page.text)
-            for conf in confirmations_json['conf']:
-                data_confid = conf['id']
-                nonce = conf['nonce']
-                creator_id = conf['creator_id']
-                confirmations.append(Confirmation(data_confid, nonce, creator_id))
-            return confirmations
+        if confirmations_page.status_code != 200:
+            raise ConfirmationExpected(f"mobileconf getlist HTTP {confirmations_page.status_code}")
 
-        else:
-            raise ConfirmationExpected
+        try:
+            confirmations_json = json.loads(confirmations_page.text)
+        except ValueError:
+            raise ConfirmationExpected(
+                f"mobileconf getlist: не-JSON ответ: {confirmations_page.text[:200]}"
+            )
+
+        # Steam отдаёт 200 с телом {"success":false,"needauth":true}, когда сессия НЕ
+        # авторизована для эндпоинта подтверждений. Раньше это падало в KeyError 'conf'
+        # (а при status!=200 — в ПУСТОЙ ConfirmationExpected), и по тексту ошибки было
+        # не понять, что случилось.
+        if confirmations_json.get('needauth'):
+            raise SessionNeedsAuth(
+                "mobileconf needauth: сессия не авторизована для подтверждений — "
+                "нужен новый вход в аккаунт"
+            )
+        if 'conf' not in confirmations_json:
+            raise ConfirmationExpected(
+                f"mobileconf getlist без ключа 'conf': {confirmations_page.text[:200]}"
+            )
+
+        for conf in confirmations_json['conf']:
+            data_confid = conf['id']
+            nonce = conf['nonce']
+            creator_id = conf['creator_id']
+            confirmations.append(Confirmation(data_confid, nonce, creator_id))
+        return confirmations
 
     def _fetch_confirmations_page(self) -> requests.Response:
         tag = Tag.CONF.value

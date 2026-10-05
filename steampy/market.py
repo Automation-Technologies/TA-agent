@@ -7,7 +7,7 @@ from decimal import Decimal
 from curl_cffi.requests import Session
 
 from steampy.confirmation import ConfirmationExecutor
-from steampy.exceptions import ApiException, TooManyRequests, LoginRequired
+from steampy.exceptions import ApiException, TooManyRequests, LoginRequired, ConfirmationExpected, SessionNeedsAuth
 from steampy.models import Currency, SteamUrl, GameOptions
 from steampy.utils import get_listing_id_to_assets_address_from_html, get_market_listings_from_html, \
     merge_items_with_descriptions_from_listing, get_market_sell_listings_from_api
@@ -358,6 +358,19 @@ class SteamMarket:
             'sell_listings': sell_listings
         }
 
+    @staticmethod
+    def _sell_listing_awaits_confirmation(response: dict) -> bool:
+        if response.get("success") is not False:
+            return False
+        message = response.get("message")
+        if not isinstance(message, str):
+            return False
+        message_lower = message.lower()
+        return (
+            "listing for this item pending confirmation" in message_lower
+            or "ожидает вашего согласия" in message_lower
+        )
+
     @login_required
     def create_sell_order(self, assetid: str, game: GameOptions, money_to_receive: str) -> dict:
         data = {
@@ -377,8 +390,8 @@ class SteamMarket:
             raise ApiException(
                 f"Steam вернул не-JSON при create_sell_order: status={response.status_code}, body={text!r}, error={e}"
             ) from e
-        if response.get("needs_mobile_confirmation"):
-            return self._confirm_sell_listing(assetid)
+        if response.get("needs_mobile_confirmation") or self._sell_listing_awaits_confirmation(response):
+            return self._confirm_sell_listing_with_retry(assetid)
         return response
 
     def create_buy_order(self, market_name: str, price_single_item: str, quantity: int, game: GameOptions,
@@ -503,3 +516,25 @@ class SteamMarket:
         con_executor = ConfirmationExecutor(self._steam_guard['identity_secret'], self._steam_guard['steamid'],
                                             self._session)
         return con_executor.confirm_sell_listing(asset_id)
+
+    def _confirm_sell_listing_with_retry(self, asset_id: str, attempts: int = 6, base_delay: float = 3.0) -> dict:
+        # Подтверждение листинга может появиться в mobileconf не мгновенно,
+        # а при массовом выставлении (или троттлинге Steam) список подтверждений
+        # отдаётся с заметной задержкой. Поэтому ждём с нарастающим бэкоффом.
+        # ВАЖНО: повторяем ТОЛЬКО подтверждение, листинг повторно НЕ создаём,
+        # поэтому дублей листингов не возникает. Задержка добавляется лишь на
+        # пути сбоя — при успешном подтверждении возврат происходит сразу.
+        last_exc = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._confirm_sell_listing(asset_id)
+            except SessionNeedsAuth:
+                # needauth ретраями не лечится (нужен новый вход в аккаунт) —
+                # пробрасываем сразу, чтобы не ждать впустую.
+                raise
+            except ConfirmationExpected as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    # Нарастающий бэкофф: 3, 6, 9, 12, 15с (ограничен 20с)
+                    time.sleep(min(base_delay + (attempt - 1) * 3.0, 20.0))
+        raise last_exc
