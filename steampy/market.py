@@ -13,6 +13,25 @@ from steampy.utils import get_listing_id_to_assets_address_from_html, get_market
     merge_items_with_descriptions_from_listing, get_market_sell_listings_from_api
 
 
+_BUY_ORDERS_COUNTER = re.compile(rb'id="my_market_buylistings_number"[^>]*>([^<]*)<')
+_BUY_ORDER_ROW = re.compile(rb'id="mybuyorder_\d+"')
+
+
+def expected_buy_orders_count(html: bytes) -> int:
+    """Сколько заявок на покупку сама страница маркета говорит, что есть.
+
+    Берём то, что не зависит от языка и от того, как мы разбираем блоки: счётчик
+    в заголовке блока заявок (id="my_market_buylistings_number", «(957)») и число
+    строк mybuyorder_<id> в сыром HTML. Счётчика нет и строк нет — 0 (у аккаунта
+    без заявок блока может не быть вовсе, это нормальный ответ)."""
+    counter = 0
+    m = _BUY_ORDERS_COUNTER.search(html)
+    if m:
+        digits = re.sub(rb'\D', b'', m.group(1))
+        counter = int(digits) if digits else 0
+    return max(counter, len(_BUY_ORDER_ROW.findall(html)))
+
+
 def login_required(func):
     def func_wrapper(self, *args, **kwargs):
         if not self.was_login_executed:
@@ -104,6 +123,19 @@ class SteamMarket:
                 time.sleep(5.4)
 
                 buy_orders = listings.get('buy_orders')
+
+                # Страница говорит «заявки есть», а разбор не нашёл ни одной — это поломка
+                # разбора, а не пустой аккаунт. Отдать {} нельзя: сервер примет его за
+                # «0 заявок» — сочтёт их исполненными, не сможет снять и распланирует бюджет
+                # заново. Ровно так после смены русского заголовка блока 16.09.2026 агент
+                # отдавал серверу 0 заявок (BUG-103). Падаем громко, а ретрай ниже переживёт
+                # разовый кривой ответ.
+                expected = expected_buy_orders_count(response.content)
+                if expected and not buy_orders:
+                    raise ApiException(
+                        f"Steam показывает заявок на покупку: {expected}, а разобрано 0 — "
+                        f"разметка страницы маркета изменилась, список заявок неизвестен"
+                    )
 
                 if buy_orders is not None:
                     break
