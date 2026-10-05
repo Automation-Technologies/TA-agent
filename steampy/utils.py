@@ -105,6 +105,9 @@ def merge_items(items: List[dict], descriptions: dict, **kwargs) -> dict:
     return merged_items
 
 
+BUY_ORDER_ROW_ID = re.compile(r'mybuyorder_\d+')
+
+
 def get_market_listings_from_html(html) -> dict:
     only_my_listings = SoupStrainer(id="myListings")
     document = BeautifulSoup(html, "lxml", parse_only=only_my_listings)
@@ -112,15 +115,20 @@ def get_market_listings_from_html(html) -> dict:
     sell_listings_dict = {}
     buy_orders_dict = {}
     for node in nodes:
-        if "My sell listings" in node.text or "Мои лоты на продажу" in node.text:
+        # Блок заявок узнаём по строкам mybuyorder_<id>, а не по заголовку. 16.09.2026 Steam
+        # переписал русскую локализацию маркета («запрос на покупку» → «заявка»), заголовок
+        # «Мои запросы на покупку» пропал, и у аккаунтов с русским Steam агент стал отдавать
+        # серверу 0 заявок вместо реальных. Английские аккаунты это не задело.
+        # Пустой блок без строк разбирать незачем — результат и так {}.
+        if node.find("div", {"id": BUY_ORDER_ROW_ID}) is not None:
+            buy_orders_dict = get_buy_orders_from_node(node)
+        elif "My sell listings" in node.text or "Мои лоты на продажу" in node.text:
             sell_listings_dict = get_sell_listings_from_node(node)
         elif "My listings awaiting confirmation" in node.text or "Лоты, ожидающие подтверждения" in node.text:
             sell_listings_awaiting_conf = get_sell_listings_from_node(node)
             for listing in sell_listings_awaiting_conf.values():
                 listing["need_confirmation"] = True
             sell_listings_dict.update(sell_listings_awaiting_conf)
-        elif "My buy orders" in node.text or "Мои запросы на покупку" in node.text:
-            buy_orders_dict = get_buy_orders_from_node(node)
     return {"buy_orders": buy_orders_dict, "sell_listings": sell_listings_dict}
 
 
@@ -148,7 +156,7 @@ def get_market_sell_listings_from_api(html: str) -> dict:
 
 def get_buy_orders_from_node(node: Tag) -> dict:
     from urllib.parse import unquote
-    buy_orders_raw = node.findAll("div", {"id": re.compile('mybuyorder_\\d+')})
+    buy_orders_raw = node.findAll("div", {"id": BUY_ORDER_ROW_ID})
     buy_orders_dict = {}
     for order in buy_orders_raw:
         mem = order
