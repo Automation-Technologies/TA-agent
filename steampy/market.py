@@ -216,136 +216,65 @@ class SteamMarket:
 
     @login_required
     def get_my_sell_listings(self) -> dict:
-        """Получение только sell-листингов с полной догрузкой"""
-        max_retries = 5
-        sell_listings = None
-        last_error = None
+        """Все sell-листинги через render-эндпоинт с пагинацией и ретраями.
 
-        for attempt in range(max_retries):
-            try:
-                response = self._session.get("%s/market" % SteamUrl.COMMUNITY_URL, timeout=60)
-                if response.status_code != 200:
-                    last_error = f"HTTP code: {response.status_code}"
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt
-                        time.sleep(delay)
-                        continue
-                    else:
-                        raise ApiException(f"There was a problem getting sell listings. {last_error}")
+        Раньше метод парсил спаны _total/_end со страницы /market, которые Steam
+        отдаёт НЕСТАБИЛЬНО (часто пусто) → возвращались только лоты с самой страницы
+        (или {}) даже при сотнях активных листингов, и сервер не находил listing_id
+        только что выставленных предметов. Render-эндпоинт (/market/mylistings/render)
+        отдаёт total_count и results_html надёжно — идём постранично, ретраим флап
+        Steam (иногда отдаёт [] вместо объекта). Возврат: {listing_id: {...,
+        'description': {'id': asset_id, ...}}}.
+        """
+        all_sell: dict = {}
+        start = 0
+        page = 100
+        total = None
+        MAX_PAGES = 500  # предохранитель от бесконечного цикла (до ~50000 листингов)
 
-                pattern = re.search(rb'var\s+g_rgAssets\s*=\s*(\{.*?});\n', response.content, re.DOTALL)
-                if pattern:
-                    json_bytes = pattern.group(1)
-                    assets_descriptions = json.loads(json_bytes.decode('utf-8'))
-                else:
-                    assets_descriptions = {}
-                
-                listing_id_to_assets_address = get_listing_id_to_assets_address_from_html(response.content)
-                listings = get_market_listings_from_html(response.content)
-                listings = merge_items_with_descriptions_from_listing(
-                    listings, 
-                    listing_id_to_assets_address,
-                    assets_descriptions
-                )
-                
-                end_pattern = re.search(rb'<span id="tabContentsMyActiveMarketListings_end">(\d+)</span>', response.content)
-                total_pattern = re.search(rb'<span id="tabContentsMyActiveMarketListings_total">([\d,]+)</span>', response.content)
-                
-                if end_pattern and total_pattern:
-                    n_showing = int(end_pattern.group(1).decode('utf-8'))
-                    n_total = int(total_pattern.group(1).decode('utf-8').replace(',', ''))
-                    
-                    if n_showing < n_total < 1000:
-                        url = "%s/market/mylistings/render/?query=&start=%s&count=%s" % (
-                            SteamUrl.COMMUNITY_URL,
-                            n_showing,
-                            -1
-                        )
-                        response = self._session.get(url, timeout=60)
-                        if response.status_code != 200:
-                            last_error = f"HTTP code: {response.status_code} (render endpoint)"
-                            if attempt < max_retries - 1:
-                                delay = 2 ** attempt
-                                time.sleep(delay)
-                                continue
-                            else:
-                                raise ApiException(f"There was a problem getting sell listings. {last_error}")
-                        jresp = response.json()
-                        listing_id_to_assets_address = get_listing_id_to_assets_address_from_html(jresp.get("hovers"))
-                        listings_2 = get_market_sell_listings_from_api(jresp.get("results_html"))
-                        listings_2 = merge_items_with_descriptions_from_listing(
-                            listings_2,
-                            listing_id_to_assets_address,
-                            jresp.get("assets")
-                        )
-                        listings["sell_listings"] = {
-                            **listings["sell_listings"],
-                            **listings_2["sell_listings"],
-                        }
-                    else:
-                        # n_total >= 1000: пагинация по 100 записей с обязательной задержкой между запросами
-                        for i in range(0, n_total, 100):
-                            url = "%s/market/mylistings/?query=&start=%s&count=%s" % (
-                                SteamUrl.COMMUNITY_URL,
-                                n_showing + i,
-                                100
-                            )
-                            response = self._session.get(url, timeout=60)
-                            if response.status_code != 200:
-                                last_error = f"HTTP code: {response.status_code} (pagination endpoint, offset {i})"
-                                if attempt < max_retries - 1:
-                                    # даём внешнему циклу attempt отработать ретрай
-                                    break
-                                else:
-                                    raise ApiException(f"There was a problem getting sell listings. {last_error}")
-                            jresp = response.json()
-                            listing_id_to_assets_address = get_listing_id_to_assets_address_from_html(jresp.get("hovers"))
-                            listings_2 = get_market_sell_listings_from_api(jresp.get("results_html"))
-                            listings_2 = merge_items_with_descriptions_from_listing(
-                                listings_2,
-                                listing_id_to_assets_address,
-                                jresp.get("assets")
-                            )
-                            listings["sell_listings"] = {
-                                **listings["sell_listings"],
-                                **listings_2["sell_listings"],
-                            }
-                            
-                            # обязательная пауза между запросами к Steam
-                            time.sleep(5.4)
-
-                time.sleep(5.4)
-
-                sell_listings = listings.get('sell_listings')
-
-                if sell_listings is not None:
-                    break
-
-                if attempt < max_retries - 1:
-                    delay = 2 ** attempt
-                    time.sleep(delay)
-                else:
-                    raise ApiException(
-                        f"Steam вернул пустой ответ после {max_retries} попыток. sell_listings={sell_listings}"
+        for _ in range(MAX_PAGES):
+            jresp = None
+            for attempt in range(4):
+                try:
+                    url = "%s/market/mylistings/render/?query=&start=%s&count=%s" % (
+                        SteamUrl.COMMUNITY_URL, start, page
                     )
-            except ApiException as e:
-                if attempt == max_retries - 1:
-                    raise
-                last_error = str(e)
-                delay = 2 ** attempt
-                time.sleep(delay)
-            except Exception as e:
-                last_error = str(e)
-                if attempt < max_retries - 1:
-                    delay = 2 ** attempt
-                    time.sleep(delay)
-                else:
-                    raise ApiException(
-                        f"Ошибка при получении sell-листингов после {max_retries} попыток. "
-                        f"Последняя ошибка: {last_error}"
-                    )
+                    response = self._session.get(url, timeout=60)
+                    if response.status_code == 200:
+                        j = response.json()
+                        # под троттлингом Steam иногда отдаёт [] вместо объекта
+                        if isinstance(j, dict) and j.get("results_html") is not None:
+                            jresp = j
+                            break
+                except Exception:
+                    pass
+                time.sleep(3.0 + attempt * 2.0)
 
-        return sell_listings
+            if jresp is None:
+                # страница не догрузилась после ретраев — отдаём собранное
+                break
+
+            if total is None:
+                total = jresp.get("total_count") or 0
+
+            listing_id_to_assets_address = get_listing_id_to_assets_address_from_html(jresp.get("hovers") or "")
+            listings = get_market_sell_listings_from_api(jresp.get("results_html"))
+            listings = merge_items_with_descriptions_from_listing(
+                listings,
+                listing_id_to_assets_address,
+                jresp.get("assets") or {},
+            )
+            page_sell = listings.get("sell_listings", {})
+            if not page_sell:
+                break
+
+            all_sell.update(page_sell)
+            start += page
+            if start >= (total or 0):
+                break
+            time.sleep(5.4)  # обязательная пауза между запросами к Steam
+
+        return all_sell
 
     @login_required
     def get_my_market_listings(self) -> dict:
