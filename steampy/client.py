@@ -156,8 +156,14 @@ class SteamClient:
             raise ApiException(
                 f"Steam вернул не-JSON при get_partner_inventory: status={resp.status_code}, body={text!r}, error={e}"
             ) from e
+        # На 429/5xx Steam отдаёт и тело 'null' — раньше это падало TypeError прямо на разборе
+        if not isinstance(response_dict, dict):
+            raise ApiException(
+                f"Steam вернул не объект при get_partner_inventory: status={resp.status_code}, "
+                f"body={str(response_dict)[:100]!r}"
+            )
 
-        if response_dict['success'] != 1:
+        if response_dict.get('success') != 1:
             raise ApiException('Success value should be 1.')
         if merge:
             return merge_items_with_descriptions_from_inventory(response_dict, game)
